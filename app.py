@@ -3,6 +3,7 @@ from supabase import create_client
 from datetime import date, datetime
 import pandas as pd
 import os
+import requests
 
 st.set_page_config(page_title="Espaço Máximos | Estoque & Vendas", page_icon="🌸", layout="wide")
 
@@ -123,36 +124,207 @@ if page == "Início":
     else:
         st.info("Suas vendas aparecerão aqui depois que você registrar a primeira.")
 
+
+
 elif page == "Produtos":
-    page_header("Produtos", "Cadastre produtos ou importe sua base de catálogo.")
+    page_header("Produtos", "Pesquise no catálogo ou cadastre seus produtos.")
+
+    def consultar_si5(termo):
+        token = st.secrets.get("SI5_API_TOKEN", "")
+        if not token:
+            return [], "Token SI5 não configurado nos Secrets do Streamlit."
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+        base = "https://global.si5.com.br/api/produtos"
+
+        try:
+            if termo.isdigit() and len(termo) in (8, 12, 13, 14):
+                response = requests.get(
+                    f"{base}/{termo}",
+                    headers=headers,
+                    timeout=12
+                )
+                if response.status_code == 404:
+                    response = requests.get(
+                        base,
+                        headers=headers,
+                        params={"q": termo, "per_page": 20},
+                        timeout=12
+                    )
+                    response.raise_for_status()
+                    return response.json().get("data", []), None
+
+                response.raise_for_status()
+                item = response.json()
+                return ([item] if item.get("codbar") else []), None
+
+            response = requests.get(
+                base,
+                headers=headers,
+                params={"q": termo, "per_page": 20},
+                timeout=12
+            )
+            response.raise_for_status()
+            return response.json().get("data", []), None
+
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status == 401:
+                return [], "Token inválido. Confira os Secrets do Streamlit."
+            if status == 429:
+                return [], "Limite diário de consultas atingido. Tente novamente amanhã."
+            return [], f"Erro na consulta ao catálogo (HTTP {status})."
+        except requests.RequestException:
+            return [], "Não foi possível acessar o catálogo. Confira sua conexão e tente novamente."
+        except (ValueError, AttributeError):
+            return [], "A resposta do catálogo veio em formato inesperado."
+
+    st.markdown("### 🔎 Buscar produto no catálogo")
+    st.caption("Pesquise pelo código de barras (EAN) ou pelo nome. A consulta inclui Natura, Avon, O Boticário e outras marcas disponíveis na base.")
+
+    busca_col, botao_col = st.columns([4, 1])
+    termo = busca_col.text_input(
+        "Digite o EAN ou nome do produto",
+        key="si5_query"
+    )
+    pesquisar = botao_col.button(
+        "Pesquisar",
+        use_container_width=True,
+        key="si5_search_button"
+    )
+
+    if pesquisar:
+        st.session_state.pop("si5_selected_index", None)
+        st.session_state["si5_results"] = []
+        st.session_state["si5_error"] = ""
+
+        if not termo.strip():
+            st.session_state["si5_error"] = "Digite um EAN ou nome para pesquisar."
+        else:
+            resultados, erro = consultar_si5(termo.strip())
+            st.session_state["si5_results"] = resultados
+            st.session_state["si5_error"] = erro or ""
+
+    if st.session_state.get("si5_error"):
+        st.warning(st.session_state["si5_error"])
+
+    resultados = st.session_state.get("si5_results", [])
+
+    if resultados:
+        st.success(f"{len(resultados)} resultado(s) encontrado(s).")
+
+        selecionado = st.selectbox(
+            "Escolha o produto encontrado",
+            options=range(len(resultados)),
+            format_func=lambda i: (
+                f'{resultados[i].get("produto", "Sem nome")} | '
+                f'{resultados[i].get("marca") or "Marca não informada"} | '
+                f'EAN: {resultados[i].get("codbar") or "Não informado"}'
+            ),
+            key="si5_selected_index"
+        )
+
+        if st.button("Usar dados deste produto no cadastro", key="si5_use_product"):
+            produto = resultados[selecionado]
+            marca_api = str(produto.get("marca") or "").upper()
+
+            if "NATURA" in marca_api:
+                marca_final = "Natura"
+            elif "AVON" in marca_api:
+                marca_final = "Avon"
+            elif "BOTIC" in marca_api:
+                marca_final = "O Boticário"
+            else:
+                marca_final = "Outra"
+
+            ean = str(produto.get("codbar") or "").strip()
+
+            st.session_state["product_code"] = ean
+            st.session_state["product_barcode"] = ean
+            st.session_state["product_brand"] = marca_final
+            st.session_state["product_name"] = str(produto.get("produto") or "")
+            st.session_state["product_category"] = str(produto.get("categoria") or "")
+
+            st.rerun()
+
+    elif pesquisar and not st.session_state.get("si5_error"):
+        st.info("Nenhum produto encontrado. Você pode fazer o cadastro manual abaixo.")
+
+    st.divider()
+
     with st.expander("+ Cadastrar produto", expanded=True):
         with st.form("new_product", clear_on_submit=True):
-            x1,x2,x3 = st.columns(3)
-            code = x1.text_input("Código interno / catálogo *")
-            barcode = x2.text_input("Código de barras (EAN)")
-            brand = x3.selectbox("Marca", ["Natura","Avon","O Boticário","Outra"])
-            name = st.text_input("Nome do produto *")
-            x4,x5,x6 = st.columns(3)
-            category = x4.text_input("Categoria")
+            x1, x2, x3 = st.columns(3)
+            code = x1.text_input(
+                "Código interno / catálogo *",
+                key="product_code"
+            )
+            barcode = x2.text_input(
+                "Código de barras (EAN)",
+                key="product_barcode"
+            )
+            brand = x3.selectbox(
+                "Marca",
+                ["Natura", "Avon", "O Boticário", "Outra"],
+                key="product_brand"
+            )
+
+            name = st.text_input("Nome do produto *", key="product_name")
+
+            x4, x5, x6 = st.columns(3)
+            category = x4.text_input("Categoria", key="product_category")
             cost = x5.number_input("Custo (R$)", min_value=0.0, step=1.0)
             price = x6.number_input("Preço de venda (R$)", min_value=0.0, step=1.0)
-            x7,x8 = st.columns(2)
+
+            x7, x8 = st.columns(2)
             stock = x7.number_input("Estoque inicial", min_value=0, step=1)
             minimum = x8.number_input("Estoque mínimo", min_value=0, step=1)
+
             save = st.form_submit_button("Salvar produto", use_container_width=True)
+
             if save:
                 if not code.strip() or not name.strip():
                     st.error("Preencha o código e o nome do produto.")
-                elif any(str(p.get("code","")).strip().lower()==code.strip().lower() for p in products):
+                elif any(str(p.get("code", "")).strip().lower() == code.strip().lower() for p in products):
                     st.error("Esse código já está cadastrado.")
+                elif barcode.strip() and any(str(p.get("barcode", "")).strip() == barcode.strip() for p in products):
+                    st.error("Esse EAN já está cadastrado.")
                 else:
-                    add_record("products", {"code":code.strip(),"barcode":barcode.strip(),"brand":brand,"name":name.strip(),"category":category.strip(),"cost":cost,"price":price,"stock":int(stock),"min_stock":int(minimum)})
+                    add_record("products", {
+                        "code": code.strip(),
+                        "barcode": barcode.strip(),
+                        "brand": brand,
+                        "name": name.strip(),
+                        "category": category.strip(),
+                        "cost": cost,
+                        "price": price,
+                        "stock": int(stock),
+                        "min_stock": int(minimum)
+                    })
                     st.success("Produto cadastrado!")
                     st.rerun()
+
     if products:
         df = pd.DataFrame(products)
-        show = [c for c in ["code","barcode","brand","name","category","cost","price","stock","min_stock"] if c in df.columns]
-        st.dataframe(df[show].rename(columns={"code":"Código","barcode":"EAN","brand":"Marca","name":"Produto","category":"Categoria","cost":"Custo","price":"Preço","stock":"Estoque","min_stock":"Mínimo"}), use_container_width=True, hide_index=True)
+        show = [c for c in ["code", "barcode", "brand", "name", "category", "cost", "price", "stock", "min_stock"] if c in df.columns]
+        st.dataframe(
+            df[show].rename(columns={
+                "code": "Código",
+                "barcode": "EAN",
+                "brand": "Marca",
+                "name": "Produto",
+                "category": "Categoria",
+                "cost": "Custo",
+                "price": "Preço",
+                "stock": "Estoque",
+                "min_stock": "Mínimo"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
         csv = df[show].to_csv(index=False).encode("utf-8-sig")
         st.download_button("Baixar produtos em CSV", csv, "produtos_espaco_maximos.csv", "text/csv")
     else:
